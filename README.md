@@ -96,9 +96,12 @@ flowchart LR
   reviewing.
 - **review** checks out the PR's latest commit with a read-only token and no stored
   credentials. It collects the diff against the base branch, the commit log and the PR's
-  earlier conversation into files, plus, after a push, the new commits' log and their diff
-  from the previous head (after a force push there's none; the model is told so). They're
-  files because the agent has no shell (git, for one, reads files outside the repository).
+  earlier conversation into files. After a push it adds the commits since the last review,
+  with their log and their diff from the reviewed commit. After a force push there are no
+  such commits, and the model is told so. The reviewed commit comes from a hidden marker in
+  the newest review comment, not from the push event, so commits whose review a newer push
+  cancelled still count as new. If there's no earlier review, the whole change is reviewed.
+  They're files because the agent has no shell (git, for one, reads files outside the repository).
   OpenCode is a pinned release, checksum-verified, not installed with
   `curl | bash`. The step that runs it gets the model key and no GitHub token, and the review
   is checked for the key before it's posted.
