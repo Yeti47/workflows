@@ -1,0 +1,24 @@
+name: ai-review
+
+# Reviews this repository's own pull requests with opencode-review.yml. The local reference
+# runs the PR's version of the workflow, so every change gets used for real before a tag.
+# Comments with /oc run the default branch's version. The key is a dedicated OpenCode Go key
+# in the OPENCODE_REVIEW_API_KEY secret.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  review:
+    uses: ./.github/workflows/opencode-review.yml
+    # the most any job of the review may have; only its comment job writes
+    permissions:
+      contents: read
+      pull-requests: write
+    secrets:
+      api-key: ${{ secrets.OPENCODE_REVIEW_API_KEY }}

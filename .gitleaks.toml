@@ -1,0 +1,6 @@
+# gitleaks configuration: the built-in rules. Add project allowlists here
+# (only for confirmed false positives).
+title = "workflows"
+
+[extend]
+useDefault = true
