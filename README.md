@@ -13,11 +13,16 @@ workflows. Nothing in it is secret: callers pass their own keys.
 ## opencode-review
 
 Reviews each pull request that an allowed author (the repository owner by default) opens from
-a branch of the repository, and posts the review as a comment. It's not a required check. A
-comment `/oc` or `/oc <request>` on a PR asks again, with the comment as the request: a
-follow-up question, a second look after fixes, or a debate about a finding. The reviewer sees
-the PR's earlier comments, reviews and inline comments, so it doesn't repeat what was already
-answered.
+a branch of the repository, and posts the review as a comment. It's not a required check.
+Each push to the PR gets a review too, of the new commits: it says which earlier findings
+they resolve and names the ones still open. A comment `/oc` or `/oc <request>` on a PR asks
+again, with the comment as the request: a follow-up question, a second look, or a debate
+about a finding. The reviewer sees the PR's earlier comments, reviews and inline comments, so
+it doesn't repeat what was already answered. Each review names the commit it reviewed.
+
+Reviews of pushes cost a model call each. A newer push cancels a review that's still running.
+To turn them off, set `review-pushes: false`, or leave `synchronize` out of the caller's
+trigger types, which saves the skipped runs too.
 
 ### Usage
 
@@ -27,7 +32,7 @@ name: ai-review
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -35,7 +40,7 @@ permissions: {}
 
 jobs:
   review:
-    uses: Yeti47/workflows/.github/workflows/opencode-review.yml@<commit-sha> # v1.0.0
+    uses: Yeti47/workflows/.github/workflows/opencode-review.yml@<commit-sha> # v1.1.0
     # the most any job of the review may have; only its comment job writes
     permissions:
       contents: read
@@ -62,6 +67,7 @@ merged there.
 | `model` | `opencode-go/glm-5.3-flash` | OpenCode model (`provider/model`) that writes the review |
 | `opencode-version` | `2.3.2` | OpenCode v2 release to run; change `opencode-sha256` with it |
 | `opencode-sha256` | digest of 2.3.2 | sha256 of the release's `opencode-linux-x64.tar.gz` |
+| `review-pushes` | `true` | review again after each push to the PR, focused on the new commits; needs `synchronize` in the caller's trigger types |
 | `command` | `/oc` | comment prefix that asks for a review |
 | `allowed-associations` | `["OWNER"]` | JSON array of author associations that may trigger a review; in an organization's repository, people are `MEMBER`, never `OWNER` |
 | `guide-path` | `.github/ai-review.md` | the reviewer's guide, read from the PR's base branch; optional |
@@ -76,21 +82,27 @@ merged there.
 
 ```mermaid
 flowchart LR
-  Event["PR opened, or<br/>/oc comment"] --> Gate["gate<br/>pull-requests: read<br/>allowed author?<br/>PR from this repo?"]
+  Event["PR opened, push to it,<br/>or /oc comment"] --> Gate["gate<br/>pull-requests: read<br/>allowed author?<br/>PR from this repo?"]
   Gate -->|allowed| Review["review<br/>contents + pull-requests: read<br/>checkout, diff, OpenCode<br/>(key, no GitHub token)"]
   Gate -->|"fork PR, /oc"| Comment
   Review --> Comment["comment<br/>pull-requests: write<br/>posts the review"]
 ```
 
 - **gate** runs only for allowed authors: their non-draft PRs from a branch of the
-  repository, and their `/oc` comments on PRs. Comment events run with secrets and don't say
+  repository (opened, reopened, ready for review, or pushed to), and their `/oc` comments on
+  PRs. Comment events run with secrets and don't say
   where the PR comes from, so the gate asks the API before anything is checked out. A fork's
   code never meets the key; for an `/oc` on a fork's PR the comment job says so instead of
   reviewing.
 - **review** checks out the PR's latest commit with a read-only token and no stored
   credentials. It collects the diff against the base branch, the commit log and the PR's
-  earlier conversation into files, because the agent has no shell (git, for one, reads files
-  outside the repository). OpenCode is a pinned release, checksum-verified, not installed with
+  earlier conversation into files. After a push it adds the commits since the last review,
+  with their log and their diff from the reviewed commit. After a force push there are no
+  such commits, and the model is told so. The reviewed commit comes from a hidden marker in
+  the newest review comment, not from the push event, so commits whose review a newer push
+  cancelled still count as new. If there's no earlier review, the whole change is reviewed.
+  They're files because the agent has no shell (git, for one, reads files outside the repository).
+  OpenCode is a pinned release, checksum-verified, not installed with
   `curl | bash`. The step that runs it gets the model key and no GitHub token, and the review
   is checked for the key before it's posted.
 - **comment** is the only job that can write, and only comments.

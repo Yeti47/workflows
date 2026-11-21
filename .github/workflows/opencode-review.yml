@@ -1,7 +1,8 @@
 name: opencode-review
 
 # Reusable workflow: reviews a pull request with OpenCode and posts the review as a PR
-# comment. A comment starting with the command (/oc by default) from an allowed author asks
+# comment, and again after each push, focused on the new commits (unless review-pushes is
+# off). A comment starting with the command (/oc by default) from an allowed author asks
 # again, with the comment as the request. Usage, inputs and the security model are in the
 # README.
 #
@@ -35,6 +36,12 @@ on:
         description: sha256 of that release's opencode-linux-x64.tar.gz (GitHub's asset digest).
         type: string
         default: 563b5d663637226b6e3bb4bb6803281bc39b0d2cd88db06d674b6420aab009b0
+      review-pushes:
+        description: >-
+          Review again when commits are pushed to the PR, focused on the new ones. Needs the
+          caller to trigger on pull_request synchronize.
+        type: boolean
+        default: true
       command:
         description: Comment prefix that asks for a review (alone, or followed by a space and a request).
         type: string
@@ -65,11 +72,13 @@ permissions:
 
 jobs:
   gate:
-    # allowed authors' non-draft PRs from this repository, and their review comments on PRs;
-    # other PRs and comments skip the whole workflow
+    # allowed authors' non-draft PRs from this repository (and pushes to them, unless turned
+    # off), and their review comments on PRs; other PRs and comments skip the whole workflow
     if: >-
       (github.event_name == 'pull_request'
+          && github.event.pull_request.state == 'open'
           && !github.event.pull_request.draft
+          && (github.event.action != 'synchronize' || inputs.review-pushes)
           && contains(fromJSON(inputs.allowed-associations), github.event.pull_request.author_association)
           && github.event.pull_request.head.repo.full_name == github.repository)
       || (github.event_name == 'issue_comment'
@@ -120,6 +129,8 @@ jobs:
       pull-requests: read
     outputs:
       review: ${{ steps.review.outputs.review }}
+      commit: ${{ steps.change.outputs.commit }}
+      sha: ${{ steps.change.outputs.sha }}
     env:
       BASE_REF: ${{ needs.gate.outputs.base }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -134,25 +145,67 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Collect the change
+        id: change
         # the agent has no shell (git can read files outside the repository), so it gets the
-        # diff and the commit log as attached files
+        # diff and the commit log as attached files; after a push, also what's new since the
+        # last review. That's the commit in the newest review comment's marker, not the push's
+        # "before": a push that cancels a running review would otherwise hide the commits that
+        # review never finished.
         env:
+          GH_TOKEN: ${{ github.token }}
           LIMIT: ${{ inputs.max-diff-bytes }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           change="$RUNNER_TEMP/change"
           mkdir -p "$change"
+          # every step resends the context: cap a diff, and tell the model where it was cut
+          cap() {
+            if [ "$(stat -c %s "$1")" -gt "$LIMIT" ]; then
+              head -c "$LIMIT" "$1" > "$1.cut"
+              printf '\n\n[diff cut at %s bytes: read the remaining changed files directly]\n' "$LIMIT" >> "$1.cut"
+              mv "$1.cut" "$1"
+            fi
+          }
           {
             git diff --stat "origin/${BASE_REF}...HEAD"
             echo
             git diff "origin/${BASE_REF}...HEAD"
           } > "$change/diff.txt"
+          cap "$change/diff.txt"
           git log --no-merges --format='%h %s%n%n%b' "origin/${BASE_REF}..HEAD" > "$change/log.txt"
-          # every step resends the context: cap the diff, and tell the model where it was cut
-          if [ "$(stat -c %s "$change/diff.txt")" -gt "$LIMIT" ]; then
-            head -c "$LIMIT" "$change/diff.txt" > "$change/diff.cut"
-            printf '\n\n[diff cut at %s bytes: read the remaining changed files directly]\n' "$LIMIT" >> "$change/diff.cut"
-            mv "$change/diff.cut" "$change/diff.txt"
+          if [ "$EVENT_ACTION" = "synchronize" ]; then
+            # only this workflow's comments count (nobody else posts as github-actions[bot]),
+            # and in each only the last marker: the one the comment job appends, after the
+            # model's text
+            last="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              --jq '.[] | select(.user.login == "github-actions[bot]")
+                | [.body | capture("<!-- opencode-review: reviewed (?<sha>[0-9a-f]{40}) -->"; "g")]
+                | last | .sha // empty' | tail -n 1)"
+            if [ -z "$last" ]; then
+              # no earlier review of the PR's commits (they failed, or came before this
+              # workflow reviewed pushes): a full review, without push.txt
+              echo "No earlier review found: reviewing the whole change."
+            elif git cat-file -e "${last}^{commit}" 2>/dev/null \
+                && git merge-base --is-ancestor "$last" HEAD; then
+              {
+                echo "Commits since the last review, of ${last:0:7}:"
+                echo
+                git log --no-merges --format='%h %s%n%n%b' "${last}..HEAD"
+                git diff --stat "$last" HEAD
+                echo
+                git diff "$last" HEAD
+              } > "$change/push.txt"
+              cap "$change/push.txt"
+            else
+              # after a force push or a rebase the reviewed commit is gone or not an ancestor:
+              # there are no "new commits" then, only the whole change again
+              echo "The branch was rewritten (force push or rebase) since the last review, of ${last:0:7}: there are no new commits to show apart, only the whole change." > "$change/push.txt"
+            fi
           fi
+          {
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
       - name: Put this workflow's review agent in place of the checkout's OpenCode config
         # OpenCode loads the checkout's .opencode/ (agents, and plugins: code that runs inside
         # the process holding the key) and opencode.json(c). All of it goes, on every run, and
@@ -220,7 +273,14 @@ jobs:
              changed files first) and `log.txt` (its commits). The repository is checked out at
              the pull request's latest commit; read surrounding code with your file tools where
              a change depends on it. You have no shell.
-          3. Look for, in this order:
+          3. After a push, `push.txt` is attached too. It describes what's new since the last
+             review: usually the new commits' log and their diff from the reviewed commit, or
+             a note that the branch was rewritten, so there's only the whole change. Review
+             what's new, and say which earlier findings in `conversation.txt` it resolves. Name
+             findings that are still open in one line each, without explaining them again. If
+             the base branch was merged in, `push.txt` contains its changes as well: compare
+             with `diff.txt`, and review only what the pull request changes.
+          4. Look for, in this order:
              - **Bugs:** wrong behaviour, missed edge cases, broken error handling, race
                conditions, data loss, migrations that lose or corrupt data.
              - **Security:** secrets in code or logs, missing authorization, injection, unsafe
@@ -228,7 +288,7 @@ jobs:
              - **Conventions:** what the repository's documented conventions require.
              - **Tests:** changed behaviour without a test that would catch a regression.
              - **Docs:** README or other docs that no longer match the change.
-          4. Skip what CI already checks: formatting, the build, the tests passing. Skip style
+          5. Skip what CI already checks: formatting, the build, the tests passing. Skip style
              preferences and praise.
 
           ## Output
@@ -318,6 +378,9 @@ jobs:
               echo "${COMMENT_AUTHOR}, a maintainer, asks about this pull request:"
               echo
               printf '%s\n' "$COMMENT"
+            elif [ -f "$RUNNER_TEMP/change/push.txt" ]; then
+              echo "Commits were pushed to this pull request since the last review. Review what's"
+              echo "new; push.txt describes it."
             else
               echo "Review this pull request."
             fi
@@ -343,11 +406,15 @@ jobs:
             exit 1
           fi
           events="$RUNNER_TEMP/events.jsonl"
+          files=()
+          for name in diff log conversation push; do
+            if [ -f "$RUNNER_TEMP/change/$name.txt" ]; then
+              files+=(--file "$RUNNER_TEMP/change/$name.txt")
+            fi
+          done
           opencode run --standalone --archived --format json \
             --agent review --model "$OC_MODEL" --title "Review of PR #${PR_NUMBER}" \
-            --file "$RUNNER_TEMP/change/diff.txt" --file "$RUNNER_TEMP/change/log.txt" \
-            --file "$RUNNER_TEMP/change/conversation.txt" \
-            "$(cat "$RUNNER_TEMP/request.md")" > "$events"
+            "${files[@]}" "$(cat "$RUNNER_TEMP/request.md")" > "$events"
           # the review is the text after the last tool call (lines that aren't JSON are skipped)
           # $i is jq's, not the shell's
           # shellcheck disable=SC2016
@@ -392,13 +459,23 @@ jobs:
           ALLOWED: ${{ needs.gate.outputs.allowed }}
           REVIEW: ${{ needs.review.outputs.review }}
           MODEL: ${{ inputs.model }}
+          COMMIT: ${{ needs.review.outputs.commit }}
+          SHA: ${{ needs.review.outputs.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          marker=""
           if [ "$ALLOWED" = "true" ]; then
             text="$REVIEW"
+            reviewed=", at ${COMMIT}"
+            # the next push's review starts from here; an /oc answer isn't necessarily a
+            # review of everything, so it leaves no marker
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              marker="<!-- opencode-review: reviewed ${SHA} -->"
+            fi
           else
             text="Not reviewed: this pull request comes from a fork, and the review key never meets a fork's code."
+            reviewed=""
           fi
-          body="$(printf '%s\n\n---\n<sub>AI review: OpenCode, %s ([run](%s))</sub>' "$text" "${MODEL#*/}" "$RUN_URL")"
+          body="$(printf '%s\n\n---\n<sub>AI review: OpenCode, %s%s ([run](%s))</sub>\n%s' "$text" "${MODEL#*/}" "$reviewed" "$RUN_URL" "$marker")"
           gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$body" --jq .html_url
